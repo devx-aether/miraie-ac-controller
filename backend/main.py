@@ -1,35 +1,46 @@
-import os
-import json
 import asyncio
-from datetime import datetime, timedelta
+import json
+import os
+import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from miraie_ac import MirAIeHub, MirAIeBroker
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from miraie_ac import MirAIeBroker, MirAIeHub
 from miraie_ac.enums import (
+    ConsumptionPeriodType,
     ConvertiMode,
+    DisplayMode,
     FanMode,
     HVACMode,
     PowerMode,
     PresetMode,
     SwingMode,
-    DisplayMode,
-    ConsumptionPeriodType,
+)
+from schemas import (
+    AuthCredentialsRequest,
+    ConvertiRequest,
+    DisplayRequest,
+    FanModeRequest,
+    HVACModeRequest,
+    PowerConsumptionRequest,
+    PowerRequest,
+    PresetModeRequest,
+    SwingModeRequest,
+    TemperatureRequest,
+    UnifiedStateRequest,
 )
 
-from schemas import (
-    TemperatureRequest,
-    PowerRequest,
-    DisplayRequest,
-    HVACModeRequest,
-    ConvertiRequest,
-    FanModeRequest,
-    SwingModeRequest,
-    PresetModeRequest,
-    UnifiedStateRequest,
-    PowerConsumptionRequest,
-    AuthCredentialsRequest,
-)
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    # 2. Prevent emoji encoding crashes
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 CONFIG_FILE = "credentials.json"
 
@@ -73,11 +84,25 @@ def extract_val(attr, default=None):
 
 def format_device(device):
     st = getattr(device, "status", None)
+    
+    # Determine online status from available attributes
+    # Default to False (offline) if we can't determine status
+    is_online = False
+    
+    if hasattr(device, "is_online"):
+        is_online = bool(getattr(device, "is_online"))
+    elif hasattr(device, "is_connected"):
+        is_online = bool(getattr(device, "is_connected"))
+    elif st and hasattr(st, "is_online"):
+        is_online = bool(getattr(st, "is_online"))
+    elif st and hasattr(st, "is_connected"):
+        is_online = bool(getattr(st, "is_connected"))
+    
     return {
         "id": str(getattr(device, "id", "unknown")),
         "name": getattr(device, "name", "AC Unit"),
         "friendly_name": getattr(device, "friendly_name", None) or getattr(device, "name", "AC Unit"),
-        "online": getattr(device, "is_online", True) if hasattr(device, "is_online") else getattr(device, "is_connected", True),
+        "online": is_online,
         "temperature": int(getattr(st, "temperature", 24) or 24) if st else 24,
         "room_temperature": int(getattr(st, "room_temperature", 26) or 26) if st else 26,
         "power": str(extract_val(getattr(st, "power_mode", PowerMode.OFF), "off")).lower() if st else "off",
@@ -328,3 +353,35 @@ async def set_horizontal_swing(device_id: str, req: SwingModeRequest):
     dev = get_device(device_id)
     await dev.set_h_swing_mode(req.swing_mode)
     return {"status": "success", "device": format_device(dev)}
+
+# =============================================================
+# Mount & Serve React Static Build (Production SPA Mode)
+# =============================================================
+# Locate frontend/dist relative to backend/
+DIST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
+
+if os.path.exists(DIST_DIR):
+    assets_dir = os.path.join(DIST_DIR, "assets")
+    
+    # 1. Serve JS/CSS/image assets under /assets
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    # 2. Catch-all route to serve index.html for React Router / SPA navigation
+    @app.get("/{full_path:path}")
+    async def serve_react_app(full_path: str):
+        # Ignore API routes (let them 404 naturally if invalid)
+        if full_path.startswith("api/"):
+            return FileResponse(status_code=404)
+
+        # Serve static file if it exists (e.g. favicon.ico, manifest.json)
+        requested_file = os.path.join(DIST_DIR, full_path)
+        if os.path.exists(requested_file) and os.path.isfile(requested_file):
+            return FileResponse(requested_file)
+        
+        # Fallback to index.html for SPA routes
+        index_file = os.path.join(DIST_DIR, "index.html")
+        if os.path.exists(index_file):
+            return FileResponse(index_file)
+        
+        return {"status": "error", "message": "Frontend build index.html not found"}
