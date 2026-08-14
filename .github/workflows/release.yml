@@ -20,35 +20,43 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
+          node-version: 22
 
       - name: Build Frontend
+        shell: pwsh
         run: |
           cd frontend
-          npm ci
+          npm install
           npm run build
+          cd ..
 
       - name: Bundle Production Files
         shell: pwsh
         run: |
-          # 1. Create clean release folder
           $releaseDir = "./release_staging/miraie-controller"
-          New-Item -ItemType Directory -Path "$releaseDir/backend" -Force
-          New-Item -ItemType Directory -Path "$releaseDir/frontend" -Force
+          New-Item -ItemType Directory -Path "$releaseDir/backend" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$releaseDir/frontend" -Force | Out-Null
 
-          # 2. Copy ONLY runtime files
-          Copy-Item -Path "./backend/*.py", "./backend/requirements.txt" -Destination "$releaseDir/backend"
-          Copy-Item -Recurse -Path "./frontend/dist" -Destination "$releaseDir/frontend/dist"
-          Copy-Item -Path "./tray_app.py", "./run_server.vbs", "./README.md" -Destination "$releaseDir/"
+          # Copy backend files
+          Copy-Item -Path "./backend/*.py" -Destination "$releaseDir/backend"
+          Copy-Item -Path "./backend/requirements.txt" -Destination "$releaseDir/backend"
 
-          # 3. Zip the clean directory
-          Compress-Archive -Path "$releaseDir" -DestinationPath "./miraie-controller-windows.zip"
+          # Copy compiled frontend dist bundle
+          Copy-Item -Recurse -Path "./frontend/dist/*" -Destination "$releaseDir/frontend"
 
-      - name: Publish GitHub Release
+          # Copy explicit root launcher & helper files
+          Copy-Item -Path "./tray_app.py" -Destination "$releaseDir/"
+          Copy-Item -Path "./run_miraie_controller.vbs" -Destination "$releaseDir/"
+          Copy-Item -Path "./README.md" -Destination "$releaseDir/"
+
+          # Compress to release ZIP
+          Compress-Archive -Path "$releaseDir" -DestinationPath "./miraie-controller-windows.zip" -Force
+
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           files: ./miraie-controller-windows.zip
           draft: false

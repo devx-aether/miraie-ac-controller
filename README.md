@@ -23,7 +23,7 @@
    ```powershell
    cd backend
    python -m venv .venv
-   .\.venv\Scripts\pip install -r requirements.txt pystray pillow uvicorn requests
+   .\.venv\Scripts\pip install -r requirements.txt
    cd ..
 3. Double click the `run_miraie_controller.vbs`. The app will start in the background, a snow flake icon will appear in your system tray.
 

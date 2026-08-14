@@ -357,31 +357,31 @@ async def set_horizontal_swing(device_id: str, req: SwingModeRequest):
 # =============================================================
 # Mount & Serve React Static Build (Production SPA Mode)
 # =============================================================
-# Locate frontend/dist relative to backend/
-DIST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
+# Check both nested (../frontend/dist) and unwrapped (../frontend)
+BASE_FRONTEND = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
+DIST_PATH = None
 
-if os.path.exists(DIST_DIR):
-    assets_dir = os.path.join(DIST_DIR, "assets")
-    
-    # 1. Serve JS/CSS/image assets under /assets
+if os.path.exists(os.path.join(BASE_FRONTEND, "dist", "index.html")):
+    DIST_PATH = os.path.join(BASE_FRONTEND, "dist")
+elif os.path.exists(os.path.join(BASE_FRONTEND, "index.html")):
+    DIST_PATH = BASE_FRONTEND
+
+if DIST_PATH and os.path.exists(DIST_PATH):
+    assets_dir = os.path.join(DIST_PATH, "assets")
     if os.path.exists(assets_dir):
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
-    # 2. Catch-all route to serve index.html for React Router / SPA navigation
     @app.get("/{full_path:path}")
     async def serve_react_app(full_path: str):
-        # Ignore API routes (let them 404 naturally if invalid)
         if full_path.startswith("api/"):
             return FileResponse(status_code=404)
 
-        # Serve static file if it exists (e.g. favicon.ico, manifest.json)
-        requested_file = os.path.join(DIST_DIR, full_path)
+        requested_file = os.path.join(DIST_PATH, full_path)
         if os.path.exists(requested_file) and os.path.isfile(requested_file):
             return FileResponse(requested_file)
-        
-        # Fallback to index.html for SPA routes
-        index_file = os.path.join(DIST_DIR, "index.html")
+
+        index_file = os.path.join(DIST_PATH, "index.html")
         if os.path.exists(index_file):
             return FileResponse(index_file)
-        
-        return {"status": "error", "message": "Frontend build index.html not found"}
+
+        return {"status": "error", "message": "index.html not found"}

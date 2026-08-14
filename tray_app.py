@@ -20,11 +20,16 @@ RUN_IN_PROD = True
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.join(PROJECT_DIR, "backend")
 FRONTEND_DIR = os.path.join(PROJECT_DIR, "frontend")
-DIST_DIR = os.path.join(FRONTEND_DIR, "dist")
 LOGS_DIR = os.path.join(PROJECT_DIR, "logs")
 
+DIST_DIR = None
+if os.path.exists(os.path.join(FRONTEND_DIR, "dist", "index.html")):
+    DIST_DIR = os.path.join(FRONTEND_DIR, "dist")
+elif os.path.exists(os.path.join(FRONTEND_DIR, "index.html")):
+    DIST_DIR = FRONTEND_DIR
+
 # Automatic Mode Detection
-IS_PROD = os.path.exists(DIST_DIR) and os.path.isdir(DIST_DIR) and RUN_IN_PROD
+IS_PROD = (DIST_DIR is not None) and RUN_IN_PROD
 
 # Ports & URLs Configuration
 BACKEND_PORT = 8000
