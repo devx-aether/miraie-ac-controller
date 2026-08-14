@@ -1,69 +1,132 @@
-import asyncio
 import os
-import sys
+import json
+import asyncio
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
-from typing import Optional
-
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from miraie_ac import MirAIeBroker, MirAIeHub, SwingMode
-from miraie_ac.enums import ConvertiMode, FanMode, HVACMode, PowerMode
-from schemas import (
-    ConvertiRequest,
-    FanModeRequest,
-    HVACModeRequest,
-    PowerRequest,
-    PresetModeRequest,
-    SwingModeRequest,
-    TemperatureRequest,
-    UnifiedStateRequest,
-    # PowerConsumptionRequest,
+from miraie_ac import MirAIeHub, MirAIeBroker
+from miraie_ac.enums import (
+    ConvertiMode,
+    FanMode,
+    HVACMode,
+    PowerMode,
+    PresetMode,
+    SwingMode,
+    DisplayMode,
+    ConsumptionPeriodType,
 )
 
-load_dotenv()
+from schemas import (
+    TemperatureRequest,
+    PowerRequest,
+    DisplayRequest,
+    HVACModeRequest,
+    ConvertiRequest,
+    FanModeRequest,
+    SwingModeRequest,
+    PresetModeRequest,
+    UnifiedStateRequest,
+    PowerConsumptionRequest,
+    AuthCredentialsRequest,
+)
 
-MOBILE_NUMBER = os.getenv("MOBILE_NUMBER")
-PASSWORD = os.getenv("PASSWORD")
+CONFIG_FILE = "credentials.json"
 
-# Global instances
-hub: MirAIeHub | None = None
 broker: MirAIeBroker | None = None
+hub: MirAIeHub | None = None
 
+def load_credentials():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
 
-async def wait_for_broker_connection(broker_instance: MirAIeBroker, timeout: int = 15):
-    """Waits until the MQTT client in broker is fully initialized."""
-    start_time = asyncio.get_event_loop().time()
-    while not hasattr(broker_instance, "client") or broker_instance.client is None:
-        if asyncio.get_event_loop().time() - start_time > timeout:
-            raise TimeoutError("Timed out waiting for broker client connection.")
-        await asyncio.sleep(0.5)
+def save_credentials(mobile: str, pwd: str):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump({"mobile_number": mobile, "password": pwd}, f, indent=2)
 
+async def init_miraie(mobile: str, pwd: str):
+    global hub, broker
+    if hub and hasattr(hub, "http") and hub.http:
+        try:
+            await hub.http.close()
+        except Exception:
+            pass
+
+    broker = MirAIeBroker()
+    hub = MirAIeHub()
+    await hub.init(mobile, pwd, broker)
+
+    for _ in range(15):
+        if hasattr(broker, "client") and getattr(broker, "client") is not None:
+            break
+        await asyncio.sleep(1)
+
+def extract_val(attr, default=None):
+    if attr is None:
+        return default
+    return attr.value if hasattr(attr, "value") else attr
+
+def format_device(device):
+    st = getattr(device, "status", None)
+    return {
+        "id": str(getattr(device, "id", "unknown")),
+        "name": getattr(device, "name", "AC Unit"),
+        "friendly_name": getattr(device, "friendly_name", None) or getattr(device, "name", "AC Unit"),
+        "online": getattr(device, "is_online", True) if hasattr(device, "is_online") else getattr(device, "is_connected", True),
+        "temperature": int(getattr(st, "temperature", 24) or 24) if st else 24,
+        "room_temperature": int(getattr(st, "room_temperature", 26) or 26) if st else 26,
+        "power": str(extract_val(getattr(st, "power_mode", PowerMode.OFF), "off")).lower() if st else "off",
+        "display_mode": str(extract_val(getattr(st, "display_mode", DisplayMode.OFF), "off")).lower() if st else "off",
+        "hvac_mode": str(extract_val(getattr(st, "hvac_mode", HVACMode.COOL), "cool")).lower() if st else "cool",
+        "fan_mode": str(extract_val(getattr(st, "fan_mode", FanMode.AUTO), "auto")).lower() if st else "auto",
+        "preset_mode": str(extract_val(getattr(st, "preset_mode", PresetMode.NONE), "none")).lower() if st else "none",
+        "converti_mode": int(extract_val(getattr(st, "converti_mode", ConvertiMode.OFF), 0)) if st else 0,
+        "vertical_swing_mode": int(extract_val(getattr(st, "vertical_swing_mode", getattr(st, "v_swing_mode", SwingMode.AUTO)), 0)) if st else 0,
+        "horizontal_swing_mode": int(extract_val(getattr(st, "horizontal_swing_mode", getattr(st, "h_swing_mode", SwingMode.AUTO)), 0)) if st else 0,
+    }
+
+def get_device(device_id: str):
+    global hub
+    if not hub or not hub.home or not hub.home.devices:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="MirAIe Hub is not initialized. Setup credentials.",
+        )
+
+    for dev in hub.home.devices:
+        if str(getattr(dev, "id", "")) == device_id or str(getattr(dev, "friendly_name", "")) == device_id:
+            return dev
+
+    if len(hub.home.devices) > 0:
+        return hub.home.devices[0]
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Device {device_id} not found")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initializes the MirAIe connection once on server boot."""
-    global hub, broker
-    print("[MirAIe] Initializing connection to MirAIe service...")
-    
-    broker = MirAIeBroker()
-    hub = MirAIeHub()
-
-    try:
-        await hub.init(MOBILE_NUMBER, PASSWORD, broker)
-        await wait_for_broker_connection(broker)
-        print(f"[MirAIe] Connected! Discovered {len(hub.home.devices)} device(s).")
-    except Exception as e:
-        print(f"[MirAIe] Startup connection error: {e}")
+    creds = load_credentials()
+    if creds:
+        print(f"🔄 Auto-authenticating with {creds.get('mobile_number')}...")
+        try:
+            await init_miraie(creds["mobile_number"], creds["password"])
+            print(f"✅ MirAIe Hub Initialized successfully!")
+        except Exception as e:
+            print(f"❌ Failed to initialize MirAIe Hub: {e}")
+    else:
+        print("⚠️ No credentials found. Waiting for frontend setup.")
 
     yield
 
-    print("[MirAIe] Shutting down background service...")
+    if hub and hasattr(hub, "http") and hub.http:
+        await hub.http.close()
 
+app = FastAPI(title="MirAIe AC API Controller", lifespan=lifespan)
 
-app = FastAPI(title="MirAIe AC REST API", lifespan=lifespan)
-
-# CORS for local React development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -72,163 +135,196 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Helper Functions ---
+# --- Auth / Setup Routes ---
 
-def get_device(device_id: str, check_online: bool = True):
-    if not hub or not hub.home or not hub.home.devices:
-        raise HTTPException(status_code=503, detail="MirAIe service not initialized or no devices found.")
-
-    for device in hub.home.devices:
-        if device.id == device_id:
-            if check_online and not device.status.is_online:
-                raise HTTPException(status_code=503, detail=f"{device.friendly_name} is currently offline")
-
-            return device
-
-    raise HTTPException(status_code=404, detail=f"Device id {device_id} not found.") 
-
-def serialize_device(device):
-    """Formats raw MirAIe device data into clean JSON for the frontend."""
+@app.get("/api/auth/status")
+async def get_auth_status():
+    creds = load_credentials()
+    is_ready = bool(hub and hub.home and hub.home.devices)
     return {
-        "id": device.id,
-        "name": device.name,
-        "friendly_name": device.friendly_name,
-        "online": device.status.is_online,
-        "temperature": device.status.temperature,
-        "room_temperature": device.status.room_temperature,
-        "power": device.status.power_mode,
-        "fan_mode": device.status.fan_mode,
-        "vertical_swing_mode": device.status.v_swing_mode,
-        "horizontal_swing_mode": device.status.h_swing_mode,
-        "display_mode": device.status.display_mode,
-        "hvac_mode": device.status.hvac_mode,
-        "preset_mode": device.status.preset_mode,
-        "converti_mode": device.status.converti_mode,
+        "configured": bool(creds),
+        "connected": is_ready,
+        "mobile_number": creds.get("mobile_number") if creds else None,
     }
 
+@app.post("/api/auth/setup")
+async def setup_credentials(req: AuthCredentialsRequest):
+    try:
+        await init_miraie(req.mobile_number, req.password)
+        save_credentials(req.mobile_number, req.password)
+        return {"status": "success", "message": "MirAIe Hub Connected!"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Authentication failed: {str(e)}")
 
-# --- API Routes ---
-
-@app.get("/api/health")
-async def health_check():
-    connected = broker is not None and getattr(broker, "client", None) is not None
-    return {"status": "ok", "broker_connected": connected}
-
+# --- Device & Energy Routes ---
 
 @app.get("/api/devices")
 async def list_devices():
-    if not hub or not hub.home:
-        raise HTTPException(status_code=503, detail="MirAIe hub not ready")
-    return [serialize_device(dev) for dev in hub.home.devices]
+    if not hub or not hub.home or not hub.home.devices:
+        return []
+    return [format_device(dev) for dev in hub.home.devices]
 
 
-@app.get("/api/devices/{device_id}")
-async def get_device_status(device_id: str):
-    device = get_device(device_id, check_online=False)
-    return serialize_device(device)
+@app.post("/api/devices/{device_id}/energy")
+async def get_energy_consumption(device_id: str, req: PowerConsumptionRequest):
+    dev = get_device(device_id)
+    try:
+        period_map = {
+            "Daily": ConsumptionPeriodType.DAILY,
+            "Weekly": ConsumptionPeriodType.WEEKLY,
+            "Monthly": ConsumptionPeriodType.MONTHLY,
+            "DAILY": ConsumptionPeriodType.DAILY,
+            "WEEKLY": ConsumptionPeriodType.WEEKLY,
+            "MONTHLY": ConsumptionPeriodType.MONTHLY,
+        }
 
-# @app.get("/api/devices/{device_id}/power-consumption")
-# async def get_power_consumption_info(device_id: str, req: PowerConsumptionRequest):
-#     ...
+        raw_period = req.period_type
+        if isinstance(raw_period, ConsumptionPeriodType):
+            period_enum = raw_period
+        elif isinstance(raw_period, str):
+            period_enum = period_map.get(raw_period, ConsumptionPeriodType.DAILY)
+        else:
+            period_enum = ConsumptionPeriodType.DAILY
+
+        if isinstance(req.period_type, str) and req.period_type not in period_map:
+            period_enum = period_map.get(str(req.period_type).split('.')[-1], ConsumptionPeriodType.DAILY)
+
+        print(f"\n⚡ [ENERGY QUERY]: {period_enum} from '{req.from_date}' to '{req.to_date}'")
+        result_dict = await hub.get_energy_consumption(
+            dev,
+            period_enum,
+            req.from_date,
+            req.to_date
+        )
+        print(f"📊 [ENERGY RETURNED]: {result_dict}\n")
+
+        return {"status": "success", "data": result_dict or {}}
+    except Exception as e:
+        print(f"❌ [ENERGY ERROR]: {e}")
+        return {"status": "error", "message": str(e), "data": {}}
+
+# ... (Keep all your existing /temperature, /power, /display, /hvac-mode, /fan-mode, /preset-mode, /converti-mode, /vertical-swing, /horizontal-swing endpoints here)
+@app.post("/api/devices/{device_id}/temperature")
+async def set_temperature(device_id: str, req: TemperatureRequest):
+    dev = get_device(device_id)
+    await dev.set_temperature(req.temperature)
+    return {"status": "success", "device": format_device(dev)}
+
+@app.post("/api/devices/{device_id}/state")
+async def set_unified_state(device_id: str, req: UnifiedStateRequest):
+    dev = get_device(device_id)
+    print(f"\n⚡ Executing Preset Macro for {dev.friendly_name}: {req.model_dump(exclude_unset=True)}")
+
+    # Helper to run commands defensively without breaking the whole chain
+    async def safe_exec(name: str, coro):
+        try:
+            await coro
+            await asyncio.sleep(0.15) # Small buffer between MQTT messages
+        except Exception as err:
+            print(f"⚠️ Warning on macro step '{name}': {err}")
+
+    # 1. Power State First
+    if req.power is not None:
+        if str(req.power).lower() in ("on", "powermode.on"):
+            await safe_exec("turn_on", dev.turn_on())
+        else:
+            await safe_exec("turn_off", dev.turn_off())
+            # If turning off, no need to send further operational commands
+            return {"status": "success", "device": format_device(dev)}
+
+    # 2. HVAC Mode (Base operational mode)
+    if req.hvac_mode is not None:
+        await safe_exec("set_hvac_mode", dev.set_hvac_mode(req.hvac_mode))
+
+    # 3. Target Temperature
+    if req.temperature is not None:
+        await safe_exec("set_temperature", dev.set_temperature(req.temperature))
+
+    # 4. Preset Mode (None, Eco, Boost, Clean)
+    if req.preset_mode is not None:
+        await safe_exec("set_preset_mode", dev.set_preset_mode(req.preset_mode))
+
+    # 5. Fan Speed (Only if preset is NONE, otherwise Panasonic locks fan speed)
+    preset_val = str(extract_val(req.preset_mode, "none")).lower()
+    if req.fan_mode is not None and preset_val in ("none", "presetmode.none", ""):
+        await safe_exec("set_fan_mode", dev.set_fan_mode(req.fan_mode))
+
+    # 6. Converti Mode (Only in Cool mode without active Eco/Boost)
+    hvac_val = str(extract_val(req.hvac_mode, "cool")).lower()
+    if req.converti_mode is not None and "cool" in hvac_val and preset_val in ("none", "presetmode.none", ""):
+        await safe_exec("set_converti_mode", dev.set_converti_mode(req.converti_mode))
+
+    # 7. Swings
+    if req.vertical_swing_mode is not None:
+        await safe_exec("set_v_swing_mode", dev.set_v_swing_mode(req.vertical_swing_mode))
+
+    if req.horizontal_swing_mode is not None:
+        await safe_exec("set_h_swing_mode", dev.set_h_swing_mode(req.horizontal_swing_mode))
+
+    # 8. LED Display
+    if req.display_mode is not None:
+        disp_val = str(req.display_mode).lower()
+        if "on" in disp_val:
+            if hasattr(dev, "turn_display_light_on"):
+                await safe_exec("display_on", dev.turn_display_light_on())
+            elif hasattr(dev, "set_display_mode"):
+                await safe_exec("display_on", dev.set_display_mode(DisplayMode.ON))
+        else:
+            if hasattr(dev, "turn_display_light_off"):
+                await safe_exec("display_off", dev.turn_display_light_off())
+            elif hasattr(dev, "set_display_mode"):
+                await safe_exec("display_off", dev.set_display_mode(DisplayMode.OFF))
+
+    print(f"✅ Macro execution complete for {dev.friendly_name}\n")
+    return {"status": "success", "device": format_device(dev)}
 
 @app.post("/api/devices/{device_id}/power")
 async def set_power(device_id: str, req: PowerRequest):
-    device = get_device(device_id)
-
-    if req.power == PowerMode.ON:
-        await device.turn_on()
-    elif req.power == PowerMode.OFF:
-        await device.turn_off()
+    dev = get_device(device_id)
+    if req.power == PowerMode.ON or req.power == "on":
+        await dev.turn_on()
     else:
-        raise HTTPException(status_code=400, detail=f"Invalid power mode: {req.power}")
+        await dev.turn_off()
+    return {"status": "success", "device": format_device(dev)}
 
-    return {"status": "success", "power": req.power}
-
-
-@app.post("/api/devices/{device_id}/temperature")
-async def set_temperature(device_id: str, req: TemperatureRequest):
-    device = get_device(device_id)
-    await device.set_temperature(req.temperature)
-    return {"status": "success", "temperature": req.temperature}
+@app.post("/api/devices/{device_id}/display")
+async def set_display(device_id: str, req: DisplayRequest):
+    dev = get_device(device_id)
+    await dev.set_display_mode(req.display_mode)
+    return {"status": "success", "device": format_device(dev)}
 
 @app.post("/api/devices/{device_id}/hvac-mode")
 async def set_hvac_mode(device_id: str, req: HVACModeRequest):
-    device = get_device(device_id)
-    await device.set_hvac_mode(req.hvac_mode)
-    return {"status": "success", "hvac_mode": req.hvac_mode}
-
-@app.post("/api/devices/{device_id}/preset-mode")
-async def set_preset_mode(device_id: str, req: PresetModeRequest):
-    device = get_device(device_id)
-    await device.set_preset_mode(req.preset_mode)
-    return {"status": "success", "preset_mode": req.preset_mode}
+    dev = get_device(device_id)
+    await dev.set_hvac_mode(req.hvac_mode)
+    return {"status": "success", "device": format_device(dev)}
 
 @app.post("/api/devices/{device_id}/fan-mode")
 async def set_fan_mode(device_id: str, req: FanModeRequest):
-    device = get_device(device_id)
-    await device.set_fan_mode(req.fan_mode)
-    return {"status": "success", "fan_mode": req.fan_mode}
+    dev = get_device(device_id)
+    await dev.set_fan_mode(req.fan_mode)
+    return {"status": "success", "device": format_device(dev)}
 
-@app.post("/api/devices/{device_id}/v-swing-mode")
-async def set_v_swing_mode(device_id: str, req: SwingModeRequest):
-    device = get_device(device_id)
-    await device.set_v_swing_mode(req.swing_mode)
-    return {"status": "success", "v_swing_mode": req.swing_mode}
+@app.post("/api/devices/{device_id}/preset-mode")
+async def set_preset_mode(device_id: str, req: PresetModeRequest):
+    dev = get_device(device_id)
+    await dev.set_preset_mode(req.preset_mode)
+    return {"status": "success", "device": format_device(dev)}
 
-@app.post("/api/devices/{device_id}/h-swing-mode")
-async def set_h_swing_mode(device_id: str, req: SwingModeRequest):
-    device = get_device(device_id)
-    await device.set_h_swing_mode(req.swing_mode)
-    return {"status": "success", "h_swing_mode": req.swing_mode}
+@app.post("/api/devices/{device_id}/converti-mode")
+async def set_converti_mode(device_id: str, req: ConvertiRequest):
+    dev = get_device(device_id)
+    await dev.set_converti_mode(req.converti_mode)
+    return {"status": "success", "device": format_device(dev)}
 
-@app.post("/api/devices/{device_id}/converti")
-async def set_converti(device_id: str, req: ConvertiRequest):
-    device = get_device(device_id)
-    try:
-        await device.set_converti_mode(req.converti_mode)
-        return {"status": "success", "converti_mode": req.converti_mode}
-    except KeyError:
-        raise HTTPException(status_code=400, detail=f"Invalid converti mode: {req.converti_mode}")
+@app.post("/api/devices/{device_id}/vertical-swing")
+async def set_vertical_swing(device_id: str, req: SwingModeRequest):
+    dev = get_device(device_id)
+    await dev.set_v_swing_mode(req.swing_mode)
+    return {"status": "success", "device": format_device(dev)}
 
-
-@app.post("/api/devices/{device_id}/state")
-async def update_state(device_id: str, req: UnifiedStateRequest):
-    """Unified endpoint to apply multiple settings in one payload."""
-    device = get_device(device_id)
-    
-    if req.power is not None:
-        if req.power == PowerMode.ON:
-            await device.turn_on()
-        elif req.power == PowerMode.OFF:
-            await device.turn_off()
-
-    if req.temperature is not None:
-        await device.set_temperature(req.temperature)
-
-    if req.converti_mode is not None:
-        await device.set_converti_mode(req.converti_mode)
-
-    if req.fan_mode is not None:
-        await device.set_fan_mode(req.fan_mode)  
-
-    if req.preset_mode is not None:
-        await device.set_preset_mode(req.preset_mode) 
-
-    if req.hvac_mode is not None:
-        await device.set_hvac_mode(req.hvac_mode)
-
-    if req.horizontal_swing_mode is not None:
-        await device.set_h_swing_mode(req.horizontal_swing_mode)
-
-    if req.vertical_swing_mode is not None:
-        await device.set_v_swing_mode(req.vertical_swing_mode)
-
-    return {"status": "success", "updated_device": serialize_device(device)}
-
-
-if __name__ == "__main__":
-    import uvicorn
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+@app.post("/api/devices/{device_id}/horizontal-swing")
+async def set_horizontal_swing(device_id: str, req: SwingModeRequest):
+    dev = get_device(device_id)
+    await dev.set_h_swing_mode(req.swing_mode)
+    return {"status": "success", "device": format_device(dev)}

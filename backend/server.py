@@ -3,7 +3,7 @@ import os
 import asyncio
 from dotenv import load_dotenv
 from miraie_ac import MirAIeHub, MirAIeBroker
-from miraie_ac.enums import ConvertiMode, ConsumptionPeriodType
+from miraie_ac.enums import ConvertiMode, ConsumptionPeriodType, DisplayMode
 
 load_dotenv()
 
@@ -33,8 +33,10 @@ async def setup():
   # await hub.home.devices[0].set_converti_mode(ConvertiMode.C50)
 
   device = hub.home.devices[0]
+  hub.get_energy_consumption()
   print("DEBUG")
-  data = await hub.get_energy_consumption(device, ConsumptionPeriodType.DAILY, "12082026", "13082026")
+  data = await hub.get_energy_consumption(device, ConsumptionPeriodType.WEEKLY, "01082026", "31082026")
+  print(data)
 
 if __name__ == "__main__":
   loop_factory = asyncio.SelectorEventLoop if sys.platform == "win32" else None
