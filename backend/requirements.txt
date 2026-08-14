@@ -1,0 +1,7 @@
+fastapi[standard]
+miraie-ac
+pystray
+Pillow
+requests
+python-dotenv
+pydantic-settings
