@@ -3,6 +3,7 @@ import json
 import os
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,7 +57,7 @@ def save_credentials(mobile: str, pwd: str):
 
 async def init_miraie(mobile: str, pwd: str):
     global hub, broker
-    if hub and hub.http:
+    if hub and getattr(hub, "http", None):
         try:
             await hub.http.close()
         except Exception:
@@ -66,8 +67,9 @@ async def init_miraie(mobile: str, pwd: str):
     hub = MirAIeHub()
     await hub.init(mobile, pwd, broker)
 
+    # Safely wait for the MQTT broker client to attach without crashing
     for _ in range(15):
-        if broker.client is not None:
+        if getattr(broker, "client", None) is not None:
             break
         await asyncio.sleep(1)
 
@@ -79,33 +81,31 @@ def extract_val(attr, default=None):
 
 
 def format_device(device):
-    st = device.status
+    st = getattr(device, "status", None)
+    dev_name = getattr(device, "friendly_name", None) or getattr(device, "name", "AC Unit")
 
-    is_online = False
-    if hasattr(device, "is_online"):
-        is_online = bool(device.is_online)
-    elif hasattr(device, "is_connected"):
-        is_online = bool(device.is_connected)
-    elif st and hasattr(st, "is_online"):
+    # Determine online status safely
+    is_online = getattr(device, "is_online", getattr(device, "is_connected", True))
+    if st and hasattr(st, "is_online"):
         is_online = bool(st.is_online)
     elif st and hasattr(st, "is_connected"):
         is_online = bool(st.is_connected)
 
     return {
-        "id": str(device.id),
-        "name": getattr(device, "name", "AC Unit"),
-        "friendly_name": device.friendly_name or getattr(device, "name", "AC Unit"),
-        "online": is_online,
-        "temperature": int(st.temperature) if (st and st.temperature is not None) else 24,
-        "room_temperature": int(st.room_temperature) if (st and st.room_temperature is not None) else 26,
+        "id": str(getattr(device, "id", "unknown")),
+        "name": dev_name,
+        "friendly_name": dev_name,
+        "online": bool(is_online),
+        "temperature": int(st.temperature) if (st and getattr(st, "temperature", None) is not None) else 24,
+        "room_temperature": int(st.room_temperature) if (st and getattr(st, "room_temperature", None) is not None) else 26,
         "power": str(extract_val(st.power_mode if st else PowerMode.OFF, "off")).lower(),
         "display_mode": str(extract_val(st.display_mode if st else DisplayMode.OFF, "off")).lower(),
         "hvac_mode": str(extract_val(st.hvac_mode if st else HVACMode.COOL, "cool")).lower(),
         "fan_mode": str(extract_val(st.fan_mode if st else FanMode.AUTO, "auto")).lower(),
         "preset_mode": str(extract_val(st.preset_mode if st else PresetMode.NONE, "none")).lower(),
         "converti_mode": int(extract_val(st.converti_mode if st else ConvertiMode.OFF, 0)),
-        "vertical_swing_mode": int(extract_val(st.vertical_swing_mode if (st and hasattr(st, "vertical_swing_mode")) else (st.v_swing_mode if st else SwingMode.AUTO), 0)),
-        "horizontal_swing_mode": int(extract_val(st.horizontal_swing_mode if (st and hasattr(st, "horizontal_swing_mode")) else (st.h_swing_mode if st else SwingMode.AUTO), 0)),
+        "vertical_swing_mode": int(extract_val(getattr(st, "vertical_swing_mode", getattr(st, "v_swing_mode", 0)), 0)),
+        "horizontal_swing_mode": int(extract_val(getattr(st, "horizontal_swing_mode", getattr(st, "h_swing_mode", 0)), 0)),
     }
 
 
@@ -118,7 +118,7 @@ def get_device(device_id: str):
         )
 
     for dev in hub.home.devices:
-        if str(dev.id) == device_id or str(dev.friendly_name) == device_id:
+        if str(getattr(dev, "id", "")) == device_id or str(getattr(dev, "friendly_name", "")) == device_id:
             return dev
 
     if len(hub.home.devices) > 0:
@@ -142,7 +142,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    if hub and hub.http:
+    if hub and getattr(hub, "http", None):
         await hub.http.close()
 
 
@@ -243,7 +243,7 @@ async def set_unified_state(device_id: str, req: UnifiedStateRequest):
     async def safe_exec(name: str, coro):
         try:
             await coro
-            await asyncio.sleep(0.15)  # Small buffer between MQTT messages
+            await asyncio.sleep(0.15)
         except Exception as err:
             print(f"⚠️ Warning on macro step '{name}': {err}")
 
