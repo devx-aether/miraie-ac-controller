@@ -3,7 +3,6 @@ import json
 import os
 import sys
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +32,16 @@ from schemas import (
     TemperatureRequest,
     UnifiedStateRequest,
 )
+
+# ---------------------------------------------------------------------------
+# Explicitly inject ConvertiMode 50% only
+# ---------------------------------------------------------------------------
+if 50 not in ConvertiMode._value2member_map_:
+    c50_member = object.__new__(ConvertiMode)
+    c50_member._name_ = "C50"
+    c50_member._value_ = 50
+    ConvertiMode._value2member_map_[50] = c50_member
+    ConvertiMode._member_map_["C50"] = c50_member
 
 CONFIG_FILE = "credentials.json"
 
