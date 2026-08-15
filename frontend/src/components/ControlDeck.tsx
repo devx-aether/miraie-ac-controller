@@ -80,6 +80,101 @@ const SWING_POSITIONS: { value: SwingMode; label: string }[] = [
   { value: 5, label: 'Pos 5' },
 ];
 
+// ============================================================================
+// Official Panasonic MirAIe Swing Icons (SVG Replicas)
+// ============================================================================
+
+const MirAIeVerticalSwingIcon: React.FC<{ level: number; className?: string }> = ({ level, className = "w-6 h-6" }) => {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className={className}>
+      {/* MirAIe AC Indoor Unit Quarter Profile */}
+      <path 
+        d="M13 5H18C18.55 5 19 5.45 19 6V11C19 11.55 18.55 12 18 12C15.24 12 13 9.76 13 7V5Z" 
+        fill="currentColor" 
+      />
+
+      {/* Pos 1: Horizontal line pointing left */}
+      {level === 1 && (
+        <line x1="11" y1="5.5" x2="6" y2="5.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      )}
+
+      {/* Pos 2: Angled high-left */}
+      {level === 2 && (
+        <line x1="11" y1="8" x2="6.5" y2="10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      )}
+
+      {/* Pos 3: Angled middle 45-deg */}
+      {level === 3 && (
+        <line x1="12" y1="11" x2="7.5" y2="14.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      )}
+
+      {/* Pos 4: Angled steep down */}
+      {level === 4 && (
+        <line x1="14" y1="13" x2="11" y2="17.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      )}
+
+      {/* Pos 5: Straight down vertical */}
+      {level === 5 && (
+        <line x1="17.5" y1="13.5" x2="17.5" y2="18.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      )}
+    </svg>
+  );
+};
+
+const MirAIeHorizontalSwingIcon: React.FC<{ level: number; className?: string }> = ({ level, className = "w-6 h-6" }) => {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className={className}>
+      {/* MirAIe AC Indoor Unit Top Header Pill */}
+      <rect x="5" y="5" width="14" height="4.5" rx="2" fill="currentColor" />
+
+      {/* Pos 1: Dual parallel straight vertical lines (| |) */}
+      {level === 1 && (
+        <g stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <line x1="9.5" y1="11.5" x2="9.5" y2="16.5" />
+          <line x1="14.5" y1="11.5" x2="14.5" y2="16.5" />
+        </g>
+      )}
+
+      {/* Pos 2: Dual parallel lines tilted left (/ /) */}
+      {level === 2 && (
+        <g stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <line x1="9.5" y1="11.5" x2="7.5" y2="16.5" />
+          <line x1="14.5" y1="11.5" x2="12.5" y2="16.5" />
+        </g>
+      )}
+
+      {/* Pos 3: Left line tilted left (/), Right line straight down (|) */}
+      {level === 3 && (
+        <g stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <line x1="9.5" y1="11.5" x2="7.5" y2="16.5" />
+          <line x1="14.5" y1="11.5" x2="14.5" y2="16.5" />
+        </g>
+      )}
+
+      {/* Pos 4: Left line straight down (|), Right line tilted right (\) */}
+      {level === 4 && (
+        <g stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <line x1="9.5" y1="11.5" x2="9.5" y2="16.5" />
+          <line x1="14.5" y1="11.5" x2="16.5" y2="16.5" />
+        </g>
+      )}
+
+      {/* Pos 5: Dual parallel lines tilted right (\ \) */}
+      {level === 5 && (
+        <g stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <line x1="9.5" y1="11.5" x2="11.5" y2="16.5" />
+          <line x1="14.5" y1="11.5" x2="16.5" y2="16.5" />
+        </g>
+      )}
+    </svg>
+  );
+};
+
+
+// ============================================================================
+// Main ControlDeck Component
+// ============================================================================
+
 export const ControlDeck: React.FC<ControlDeckProps> = memo(({
   device,
   onDisplayChange,
@@ -257,14 +352,19 @@ export const ControlDeck: React.FC<ControlDeckProps> = memo(({
               return (
                 <button
                   key={value}
+                  title={`Vertical: ${label}`}
                   onClick={() => onVerticalSwingChange(value)}
-                  className={`py-1.5 rounded-lg border text-[11px] font-semibold transition-all duration-150 active:scale-95 ${
+                  className={`h-9 rounded-lg border flex items-center justify-center transition-all duration-150 active:scale-95 ${
                     isSelected
                       ? 'bg-cyan-500/10 border-cyan-500/40 text-cyan-400 shadow-sm'
                       : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-900'
                   }`}
                 >
-                  {label === 'Auto' ? 'Auto' : value}
+                  {value === 0 ? (
+                    <span className="text-[11px] font-bold tracking-wider">AUTO</span>
+                  ) : (
+                    <MirAIeVerticalSwingIcon level={value} className="w-6 h-6" />
+                  )}
                 </button>
               );
             })}
@@ -283,14 +383,19 @@ export const ControlDeck: React.FC<ControlDeckProps> = memo(({
               return (
                 <button
                   key={value}
+                  title={`Horizontal: ${label}`}
                   onClick={() => onHorizontalSwingChange(value)}
-                  className={`py-1.5 rounded-lg border text-[11px] font-semibold transition-all duration-150 active:scale-95 ${
+                  className={`h-9 rounded-lg border flex items-center justify-center transition-all duration-150 active:scale-95 ${
                     isSelected
                       ? 'bg-cyan-500/10 border-cyan-500/40 text-cyan-400 shadow-sm'
                       : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-900'
                   }`}
                 >
-                  {label === 'Auto' ? 'Auto' : value}
+                  {value === 0 ? (
+                    <span className="text-[11px] font-bold tracking-wider">AUTO</span>
+                  ) : (
+                    <MirAIeHorizontalSwingIcon level={value} className="w-6 h-6" />
+                  )}
                 </button>
               );
             })}

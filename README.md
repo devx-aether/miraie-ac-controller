@@ -51,3 +51,12 @@ Right-click the snowflake icon in your taskbar tray to access:
 - 🟢/🔴 Live Status: Real-time health status for both the API and UI.
 - 🔄 Restart / ⏹️ Stop: Manage background server processes without opening Task Manager.
 - ❌ Exit: Gracefully shuts down all background processes and exits.
+
+## ⚠️ Note on Modes & Hardware Compatibility (e.g., Heat Mode)
+
+Depending on your specific Panasonic AC model, certain features displayed in this dashboard (such as **Heat Mode** or specific **Converti** capacity levels) might not be physically supported by your unit's hardware.
+
+* **Cloud Sync Behavior:** If you click an unsupported mode (like **Heat**), Panasonic's MirAIe cloud backend accepts the payload and updates the device state across platforms—meaning the official mobile app will also show "Heat" as active, even on cooling-only units.
+* **Hardware Response:** The physical AC unit simply ignores commands for unsupported hardware features.
+
+> **Disclaimer:** This project surfaces the universal API features provided by Panasonic's MirAIe platform. Ensure you only use controls that match your physical unit's actual specifications.
