@@ -1,6 +1,7 @@
 import os
 import sys
 import subprocess
+import threading
 import webbrowser
 import time
 import requests
@@ -20,6 +21,8 @@ PYTHON_EXE = VENV_PYTHON if os.path.exists(VENV_PYTHON) else sys.executable
 
 server_proc: subprocess.Popen | None = None
 startup_time: datetime | None = None
+monitor_stop = False
+manual_stop_requested = False
 
 
 # -------------------------------------------------------------
@@ -48,7 +51,8 @@ def is_server_healthy() -> bool:
 
 
 def start_server(icon=None, item=None):
-    global server_proc, startup_time
+    global server_proc, startup_time, manual_stop_requested
+    manual_stop_requested = False
     if not is_proc_alive():
         cmd = [PYTHON_EXE, "main.py"]
         flags = 0x08000000 if sys.platform == "win32" else 0
@@ -70,7 +74,8 @@ def start_server(icon=None, item=None):
 
 
 def stop_server(icon=None, item=None):
-    global server_proc, startup_time
+    global server_proc, startup_time, manual_stop_requested
+    manual_stop_requested = True
     if server_proc is not None:
         try:
             subprocess.run(
@@ -92,6 +97,34 @@ def restart_server(icon=None, item=None):
     start_server(icon)
     if icon:
         icon.notify("Server restarted", "MirAIe Controller")
+
+
+def monitor_server():
+    """Restart the child only when it dies or stops answering HTTP requests."""
+    global monitor_stop
+    failed_checks = 0
+
+    while not monitor_stop:
+        time.sleep(10)
+        if monitor_stop:
+            break
+
+        if not is_proc_alive() and not manual_stop_requested:
+            start_server()
+            failed_checks = 0
+            continue
+
+        if is_server_healthy():
+            failed_checks = 0
+            continue
+
+        if startup_time and (datetime.now() - startup_time).total_seconds() < 30:
+            continue
+
+        failed_checks += 1
+        if failed_checks >= 3:
+            restart_server()
+            failed_checks = 0
 
 
 # -------------------------------------------------------------
@@ -155,12 +188,20 @@ def make_menu():
 
 
 def main():
+    global monitor_stop
     start_server()
+    monitor_stop = False
+    monitor_thread = threading.Thread(target=monitor_server, daemon=True)
+    monitor_thread.start()
 
     # Passing make_menu (the function itself) ensures pystray calls it
     # every time you right-click, rendering real-time status and uptime.
     icon = pystray.Icon("MirAIeAC", load_icon(), "MirAIe Controller", menu=pystray.Menu(make_menu))
-    icon.run()
+    try:
+        icon.run()
+    finally:
+        monitor_stop = True
+        stop_server()
 
 
 if __name__ == "__main__":

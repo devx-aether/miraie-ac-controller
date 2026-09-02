@@ -3,8 +3,9 @@ import json
 import os
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -47,6 +48,7 @@ CONFIG_FILE = "credentials.json"
 
 broker: MirAIeBroker | None = None
 hub: MirAIeHub | None = None
+connection_lock = asyncio.Lock()
 
 
 def load_credentials():
@@ -65,22 +67,88 @@ def save_credentials(mobile: str, pwd: str):
 
 
 async def init_miraie(mobile: str, pwd: str):
+    """Initializes or re-initializes the MirAIe Hub and MQTT Broker cleanly."""
     global hub, broker
-    if hub and getattr(hub, "http", None):
-        try:
-            await hub.http.close()
-        except Exception:
-            pass
 
-    broker = MirAIeBroker()
-    hub = MirAIeHub()
-    await hub.init(mobile, pwd, broker)
+    async with connection_lock:
+        # Tear down stale connections if present
+        if hub and getattr(hub, "http", None):
+            try:
+                await hub.http.close()
+            except Exception:
+                pass
 
-    # Safely wait for the MQTT broker client to attach without crashing
-    for _ in range(15):
-        if getattr(broker, "client", None) is not None:
-            break
-        await asyncio.sleep(1)
+        if broker and getattr(broker, "client", None):
+            try:
+                if hasattr(broker.client, "disconnect"):
+                    await broker.client.disconnect()
+            except Exception:
+                pass
+
+        new_broker = MirAIeBroker()
+        new_hub = MirAIeHub()
+        await new_hub.init(mobile, pwd, new_broker)
+
+        # Wait up to 15 seconds for the MQTT broker client to attach
+        for _ in range(15):
+            if getattr(new_broker, "client", None) is not None:
+                break
+            await asyncio.sleep(1)
+
+        broker = new_broker
+        hub = new_hub
+
+
+async def ensure_connected():
+    """Triggered on command failure to re-establish session from stored credentials."""
+    creds = load_credentials()
+    if not creds:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No credentials stored to reconnect. Set up credentials first.",
+        )
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 Refreshing MirAIe session...")
+    await init_miraie(creds["mobile_number"], creds["password"])
+
+
+def is_broker_alive() -> bool:
+    """Checks whether the underlying MQTT client is connected."""
+    if not broker:
+        return False
+    client = getattr(broker, "client", None)
+    if client is None:
+        return False
+
+    # aiomqtt / paho state validation
+    if hasattr(client, "is_connected"):
+        return bool(client.is_connected())
+    if hasattr(client, "_client") and hasattr(client._client, "is_connected"):
+        return bool(client._client.is_connected())
+    return True
+
+
+async def miraie_watchdog():
+    """Keep the MirAIe session fresh after network or laptop sleep transitions."""
+    await asyncio.sleep(20)
+    while True:
+        await asyncio.sleep(20)
+        creds = load_credentials()
+        if not creds:
+            continue
+
+        broker_healthy = is_broker_alive()
+        hub_ready = bool(hub and hub.home and hub.home.devices)
+
+        if not broker_healthy or not hub_ready:
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ Watchdog detected dropped connection "
+                f"(broker_alive={broker_healthy}, hub_ready={hub_ready}). Reconnecting..."
+            )
+            try:
+                await init_miraie(creds["mobile_number"], creds["password"])
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Watchdog successfully restored MirAIe connection.")
+            except Exception as e:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Watchdog reconnection attempt failed: {e}")
 
 
 def extract_val(attr, default=None):
@@ -136,6 +204,16 @@ def get_device(device_id: str):
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Device {device_id} not found")
 
 
+async def execute_with_retry(coro_fn, *args, **kwargs):
+    """Executes a device command, auto-reconnecting and retrying once if connection dropped."""
+    try:
+        return await coro_fn(*args, **kwargs)
+    except Exception as err:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ Command failed ({err}). Attempting auto-reconnect...")
+        await ensure_connected()
+        return await coro_fn(*args, **kwargs)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     creds = load_credentials()
@@ -145,14 +223,30 @@ async def lifespan(app: FastAPI):
             await init_miraie(creds["mobile_number"], creds["password"])
             print("✅ MirAIe Hub Initialized successfully!")
         except Exception as e:
-            print(f"❌ Failed to initialize MirAIe Hub: {e}")
+            print(f"❌ Failed to initialize MirAIe Hub on startup: {e}")
     else:
         print("⚠️ No credentials found. Waiting for frontend setup.")
 
+    # Start background keep-alive watchdog
+    watchdog_task = asyncio.create_task(miraie_watchdog())
+
     yield
+
+    # Teardown
+    watchdog_task.cancel()
+    try:
+        await watchdog_task
+    except asyncio.CancelledError:
+        pass
 
     if hub and getattr(hub, "http", None):
         await hub.http.close()
+    if broker and getattr(broker, "client", None):
+        try:
+            if hasattr(broker.client, "disconnect"):
+                await broker.client.disconnect()
+        except Exception:
+            pass
 
 
 app = FastAPI(title="MirAIe AC API Controller", lifespan=lifespan)
@@ -171,7 +265,7 @@ app.add_middleware(
 @app.get("/api/auth/status")
 async def get_auth_status():
     creds = load_credentials()
-    is_ready = bool(hub and hub.home and hub.home.devices)
+    is_ready = bool(hub and hub.home and hub.home.devices and is_broker_alive())
     return {
         "configured": bool(creds),
         "connected": is_ready,
@@ -194,6 +288,11 @@ async def setup_credentials(req: AuthCredentialsRequest):
 @app.get("/api/devices")
 async def list_devices():
     if not hub or not hub.home or not hub.home.devices:
+        if load_credentials():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="MirAIe connection is reconnecting.",
+            )
         return []
     return [format_device(dev) for dev in hub.home.devices]
 
@@ -223,12 +322,11 @@ async def get_energy_consumption(device_id: str, req: PowerConsumptionRequest):
             period_enum = period_map.get(str(req.period_type).split(".")[-1], ConsumptionPeriodType.DAILY)
 
         print(f"\n⚡ [ENERGY QUERY]: {period_enum} from '{req.from_date}' to '{req.to_date}'")
-        result_dict = await hub.get_energy_consumption(
-            dev,
-            period_enum,
-            req.from_date,
-            req.to_date
-        )
+
+        async def _fetch():
+            return await hub.get_energy_consumption(dev, period_enum, req.from_date, req.to_date)
+
+        result_dict = await execute_with_retry(_fetch)
         print(f"📊 [ENERGY RETURNED]: {result_dict}\n")
 
         return {"status": "success", "data": result_dict or {}}
@@ -239,136 +337,194 @@ async def get_energy_consumption(device_id: str, req: PowerConsumptionRequest):
 
 @app.post("/api/devices/{device_id}/temperature")
 async def set_temperature(device_id: str, req: TemperatureRequest):
-    dev = get_device(device_id)
-    await dev.set_temperature(req.temperature)
+    async def _action():
+        dev = get_device(device_id)
+        await dev.set_temperature(req.temperature)
+        return dev
+
+    dev = await execute_with_retry(_action)
     return {"status": "success", "device": format_device(dev)}
 
 
 @app.post("/api/devices/{device_id}/state")
 async def set_unified_state(device_id: str, req: UnifiedStateRequest):
-    dev = get_device(device_id)
-    print(f"\n⚡ Executing Preset Macro for {dev.friendly_name}: {req.model_dump(exclude_unset=True)}")
+    async def _execute_macro():
+        dev = get_device(device_id)
+        print(f"\n⚡ Executing Preset Macro for {dev.friendly_name}: {req.model_dump(exclude_unset=True)}")
 
-    async def safe_exec(name: str, coro):
-        try:
-            await coro
-            await asyncio.sleep(0.15)
-        except Exception as err:
-            print(f"⚠️ Warning on macro step '{name}': {err}")
+        async def safe_exec(name: str, coro):
+            try:
+                await coro
+                await asyncio.sleep(0.15)
+            except Exception as err:
+                print(f"⚠️ Warning on macro step '{name}': {err}")
 
-    # 1. Power State First
-    if req.power is not None:
-        if str(req.power).lower() in ("on", "powermode.on"):
-            await safe_exec("turn_on", dev.turn_on())
-        else:
-            await safe_exec("turn_off", dev.turn_off())
-            return {"status": "success", "device": format_device(dev)}
+        # 1. Power State First
+        if req.power is not None:
+            if str(req.power).lower() in ("on", "powermode.on"):
+                await safe_exec("turn_on", dev.turn_on())
+            else:
+                await safe_exec("turn_off", dev.turn_off())
+                return dev
 
-    # 2. HVAC Mode
-    if req.hvac_mode is not None:
-        await safe_exec("set_hvac_mode", dev.set_hvac_mode(req.hvac_mode))
+        # 2. HVAC Mode
+        if req.hvac_mode is not None:
+            await safe_exec("set_hvac_mode", dev.set_hvac_mode(req.hvac_mode))
 
-    # 3. Target Temperature
-    if req.temperature is not None:
-        await safe_exec("set_temperature", dev.set_temperature(req.temperature))
+        # 3. Target Temperature
+        if req.temperature is not None:
+            await safe_exec("set_temperature", dev.set_temperature(req.temperature))
 
-    # 4. Preset Mode
-    if req.preset_mode is not None:
-        await safe_exec("set_preset_mode", dev.set_preset_mode(req.preset_mode))
+        # 4. Preset Mode
+        if req.preset_mode is not None:
+            await safe_exec("set_preset_mode", dev.set_preset_mode(req.preset_mode))
 
-    # 5. Fan Speed (Only if preset is NONE)
-    preset_val = str(extract_val(req.preset_mode, "none")).lower()
-    if req.fan_mode is not None and preset_val in ("none", "presetmode.none", ""):
-        await safe_exec("set_fan_mode", dev.set_fan_mode(req.fan_mode))
+        # 5. Fan Speed (Only if preset is NONE)
+        preset_val = str(extract_val(req.preset_mode, "none")).lower()
+        if req.fan_mode is not None and preset_val in ("none", "presetmode.none", ""):
+            await safe_exec("set_fan_mode", dev.set_fan_mode(req.fan_mode))
 
-    # 6. Converti Mode
-    hvac_val = str(extract_val(req.hvac_mode, "cool")).lower()
-    if req.converti_mode is not None and "cool" in hvac_val and preset_val in ("none", "presetmode.none", ""):
-        await safe_exec("set_converti_mode", dev.set_converti_mode(req.converti_mode))
+        # 6. Converti Mode
+        hvac_val = str(extract_val(req.hvac_mode, "cool")).lower()
+        if req.converti_mode is not None and "cool" in hvac_val and preset_val in ("none", "presetmode.none", ""):
+            await safe_exec("set_converti_mode", dev.set_converti_mode(req.converti_mode))
 
-    # 7. Swings
-    if req.vertical_swing_mode is not None:
-        v_swing_coro = dev.set_vertical_swing_mode(req.vertical_swing_mode) if hasattr(dev, "set_vertical_swing_mode") else dev.set_v_swing_mode(req.vertical_swing_mode)
-        await safe_exec("set_vertical_swing", v_swing_coro)
+        # 7. Swings
+        if req.vertical_swing_mode is not None:
+            v_swing_coro = (
+                dev.set_vertical_swing_mode(req.vertical_swing_mode)
+                if hasattr(dev, "set_vertical_swing_mode")
+                else dev.set_v_swing_mode(req.vertical_swing_mode)
+            )
+            await safe_exec("set_vertical_swing", v_swing_coro)
 
-    if req.horizontal_swing_mode is not None:
-        h_swing_coro = dev.set_horizontal_swing_mode(req.horizontal_swing_mode) if hasattr(dev, "set_horizontal_swing_mode") else dev.set_h_swing_mode(req.horizontal_swing_mode)
-        await safe_exec("set_horizontal_swing", h_swing_coro)
+        if req.horizontal_swing_mode is not None:
+            h_swing_coro = (
+                dev.set_horizontal_swing_mode(req.horizontal_swing_mode)
+                if hasattr(dev, "set_horizontal_swing_mode")
+                else dev.set_h_swing_mode(req.horizontal_swing_mode)
+            )
+            await safe_exec("set_horizontal_swing", h_swing_coro)
 
-    # 8. LED Display
-    if req.display_mode is not None:
-        disp_val = str(req.display_mode).lower()
-        if "on" in disp_val:
-            await safe_exec("display_on", dev.turn_display_light_on() if hasattr(dev, "turn_display_light_on") else dev.set_display_mode(DisplayMode.ON))
-        else:
-            await safe_exec("display_off", dev.turn_display_light_off() if hasattr(dev, "turn_display_light_off") else dev.set_display_mode(DisplayMode.OFF))
+        # 8. LED Display
+        if req.display_mode is not None:
+            disp_val = str(req.display_mode).lower()
+            if "on" in disp_val:
+                await safe_exec(
+                    "display_on",
+                    dev.turn_display_light_on()
+                    if hasattr(dev, "turn_display_light_on")
+                    else dev.set_display_mode(DisplayMode.ON),
+                )
+            else:
+                await safe_exec(
+                    "display_off",
+                    dev.turn_display_light_off()
+                    if hasattr(dev, "turn_display_light_off")
+                    else dev.set_display_mode(DisplayMode.OFF),
+                )
 
-    print(f"✅ Macro execution complete for {dev.friendly_name}\n")
+        print(f"✅ Macro execution complete for {dev.friendly_name}\n")
+        return dev
+
+    dev = await execute_with_retry(_execute_macro)
     return {"status": "success", "device": format_device(dev)}
 
 
 @app.post("/api/devices/{device_id}/power")
 async def set_power(device_id: str, req: PowerRequest):
-    dev = get_device(device_id)
-    if req.power == PowerMode.ON or req.power == "on":
-        await dev.turn_on()
-    else:
-        await dev.turn_off()
+    async def _action():
+        dev = get_device(device_id)
+        if req.power == PowerMode.ON or req.power == "on":
+            await dev.turn_on()
+        else:
+            await dev.turn_off()
+        return dev
+
+    dev = await execute_with_retry(_action)
     return {"status": "success", "device": format_device(dev)}
 
 
 @app.post("/api/devices/{device_id}/display")
 async def set_display(device_id: str, req: DisplayRequest):
-    dev = get_device(device_id)
-    await dev.set_display_mode(req.display_mode)
+    async def _action():
+        dev = get_device(device_id)
+        await dev.set_display_mode(req.display_mode)
+        return dev
+
+    dev = await execute_with_retry(_action)
     return {"status": "success", "device": format_device(dev)}
 
 
 @app.post("/api/devices/{device_id}/hvac-mode")
 async def set_hvac_mode(device_id: str, req: HVACModeRequest):
-    dev = get_device(device_id)
-    await dev.set_hvac_mode(req.hvac_mode)
+    async def _action():
+        dev = get_device(device_id)
+        await dev.set_hvac_mode(req.hvac_mode)
+        return dev
+
+    dev = await execute_with_retry(_action)
     return {"status": "success", "device": format_device(dev)}
 
 
 @app.post("/api/devices/{device_id}/fan-mode")
 async def set_fan_mode(device_id: str, req: FanModeRequest):
-    dev = get_device(device_id)
-    await dev.set_fan_mode(req.fan_mode)
+    async def _action():
+        dev = get_device(device_id)
+        await dev.set_fan_mode(req.fan_mode)
+        return dev
+
+    dev = await execute_with_retry(_action)
     return {"status": "success", "device": format_device(dev)}
 
 
 @app.post("/api/devices/{device_id}/preset-mode")
 async def set_preset_mode(device_id: str, req: PresetModeRequest):
-    dev = get_device(device_id)
-    await dev.set_preset_mode(req.preset_mode)
+    async def _action():
+        dev = get_device(device_id)
+        await dev.set_preset_mode(req.preset_mode)
+        return dev
+
+    dev = await execute_with_retry(_action)
     return {"status": "success", "device": format_device(dev)}
 
 
 @app.post("/api/devices/{device_id}/converti-mode")
 async def set_converti_mode(device_id: str, req: ConvertiRequest):
-    dev = get_device(device_id)
-    await dev.set_converti_mode(req.converti_mode)
+    async def _action():
+        dev = get_device(device_id)
+        await dev.set_converti_mode(req.converti_mode)
+        return dev
+
+    dev = await execute_with_retry(_action)
     return {"status": "success", "device": format_device(dev)}
 
 
 @app.post("/api/devices/{device_id}/vertical-swing")
 async def set_vertical_swing(device_id: str, req: SwingModeRequest):
-    dev = get_device(device_id)
-    if hasattr(dev, "set_vertical_swing_mode"):
-        await dev.set_vertical_swing_mode(req.swing_mode)
-    else:
-        await dev.set_v_swing_mode(req.swing_mode)
+    async def _action():
+        dev = get_device(device_id)
+        if hasattr(dev, "set_vertical_swing_mode"):
+            await dev.set_vertical_swing_mode(req.swing_mode)
+        else:
+            await dev.set_v_swing_mode(req.swing_mode)
+        return dev
+
+    dev = await execute_with_retry(_action)
     return {"status": "success", "device": format_device(dev)}
 
 
 @app.post("/api/devices/{device_id}/horizontal-swing")
 async def set_horizontal_swing(device_id: str, req: SwingModeRequest):
-    dev = get_device(device_id)
-    if hasattr(dev, "set_horizontal_swing_mode"):
-        await dev.set_horizontal_swing_mode(req.swing_mode)
-    else:
-        await dev.set_h_swing_mode(req.swing_mode)
+    async def _action():
+        dev = get_device(device_id)
+        if hasattr(dev, "set_horizontal_swing_mode"):
+            await dev.set_horizontal_swing_mode(req.swing_mode)
+        else:
+            await dev.set_h_swing_mode(req.swing_mode)
+        return dev
+
+    dev = await execute_with_retry(_action)
     return {"status": "success", "device": format_device(dev)}
 
 
@@ -391,7 +547,7 @@ if DIST_PATH and os.path.exists(DIST_PATH):
     @app.get("/{full_path:path}")
     async def serve_react_app(full_path: str):
         if full_path.startswith("api/"):
-            return FileResponse(status_code=404)
+            return Response(status_code=404)
 
         requested_file = os.path.join(DIST_PATH, full_path)
         if os.path.exists(requested_file) and os.path.isfile(requested_file):
@@ -401,7 +557,7 @@ if DIST_PATH and os.path.exists(DIST_PATH):
         if os.path.exists(index_file):
             return FileResponse(index_file)
 
-        return {"status": "error", "message": "index.html not found"}
+        return Response(content="index.html not found", status_code=404)
 
 
 if __name__ == "__main__":
@@ -417,6 +573,6 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        reload=False,
         loop=loop_type,
     )
